@@ -252,7 +252,6 @@ bool UThreadEpollScheduler::Run() {
             for (int i = 0; i < nfds; i++) {
                 UThreadSocket_t * socket = (UThreadSocket_t*) events[i].data.ptr;
                 socket->waited_events = events[i].events;
-
                 runtime_.Resume(socket->uthread_id);
             }
 
