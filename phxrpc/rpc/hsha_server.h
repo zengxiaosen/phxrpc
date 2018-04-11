@@ -81,7 +81,9 @@ class DataFlow final {
 #define QUEUE_WAIT_TIME_COST_CAL_RATE 1000
 #define MAX_QUEUE_WAIT_TIME_COST 500
 #define MAX_ACCEPT_QUEUE_LENGTH 102400
-
+/**
+ * server对象
+ */
 class HshaServerStat final {
   public:
     HshaServerStat(const HshaServerConfig *config, ServerMonitorPtr hsha_server_monitor);
@@ -206,7 +208,11 @@ class HshaServerQos final {
 };
 
 //////////////////////////////////
-
+/**
+ * 实际的工作线程（每个都是独立的线程
+ * 如果是协程模式，那么每个worker中存在
+ * 多个协程工作实例，通过epoll进行管理这些协程
+ */
 class Worker final {
   public:
     Worker(WorkerPool *pool, int uthread_count, int utherad_stack_size);
@@ -234,7 +240,9 @@ class Worker final {
 /////////////////////////////////
 
 typedef std::function<void(const BaseRequest *, BaseResponse *, DispatcherArgs_t *)> Dispatch_t;
-
+/**
+ * 管理所有的workers
+ */
 class WorkerPool final {
   public:
     WorkerPool(UThreadEpollScheduler * scheduler,
@@ -298,6 +306,11 @@ class HshaServerIO final {
 
 class HshaServer;
 class HshaServerUnit final {
+    /**
+     * 逻辑上的工作单元，可以理解为一个工厂，
+     * 存在很多，一个unit可以包含多个worker。
+     * server接受到的client会分配给那些unit进行实际的处理
+     */
   public:
     HshaServerUnit(HshaServer *hsha_server,
             int idx,
@@ -313,8 +326,15 @@ class HshaServerUnit final {
 
   private:
     HshaServer *hsha_server_;
+    /**
+     * 这个epoll调度器，.cpp中会创建epoll调度器，
+     * 用于管理client的fds
+     */
     UThreadEpollScheduler scheduler_;
     DataFlow data_flow_;
+    /**
+     * 本质相当于一个线程池
+     */
     WorkerPool worker_pool_;
     HshaServerIO hsha_server_io_;
     std::thread thread_;

@@ -49,17 +49,22 @@ public:
         cv_.notify_one();
     }
 
+    //所以说到底，就是读取队列数据
     bool pluck(T & value) {
         std::unique_lock<std::mutex> lock(mutex_);
         if (break_out_) {
             return false;
         }
+        /**
+         * 如果队列空，等待数据
+         */
         while (queue_.empty()) {
             cv_.wait(lock);
             if (break_out_) {
                 return false;
             }
         }
+        //队列中取数据
         size_--;
         value = queue_.front();
         queue_.pop();

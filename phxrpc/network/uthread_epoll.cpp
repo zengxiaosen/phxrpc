@@ -266,6 +266,14 @@ bool UThreadEpollScheduler::Run() {
                 handler_new_request_func_();
             }
 
+            /**
+             * epoll在轮询的时候会判断server unit这个结构中是否存在数据
+             * 如果有说明有新的client，那么需要处理。
+             * 对应epoll轮询的handler_accepted_fd_func_函数，
+             * 这个函数在epoll初始化之前被赋值
+             * scheduler_->SetHandlerAcceptedFdFunc(std::bind(
+             * &HshaServerIO::HandlerAcceptedFd,this));
+             */
             if (handler_accepted_fd_func_ != nullptr) {
                 handler_accepted_fd_func_();
             }

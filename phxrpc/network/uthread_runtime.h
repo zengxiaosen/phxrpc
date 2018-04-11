@@ -27,7 +27,10 @@ See the AUTHORS file for names of contributors.
 #include "uthread_context_base.h"
 
 namespace phxrpc {
-
+/**
+ * 这个其实就是用于调度所有协程的控制结构
+ * 所有的协程都会注册到这个结构中
+ */
 class UThreadRuntime {
 public:
     UThreadRuntime(size_t stack_size, const bool need_stack_protect);

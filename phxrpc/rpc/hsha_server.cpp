@@ -42,7 +42,10 @@ using namespace std;
 
 namespace phxrpc {
 
-
+/**
+ * 所有数据包括request和response都会进入data flow
+ * 谁需要就从dataflow中拉取
+ */
 DataFlow::DataFlow() {
 }
 
@@ -457,16 +460,24 @@ void Worker::UThreadFunc(void *args, BaseRequest *req, int queue_wait_time_ms) {
 }
 
 void Worker::WorkerLogic(void *args, BaseRequest *req, int queue_wait_time_ms) {
+    //统计信息
     pool_->hsha_server_stat_->inqueue_pop_requests_++;
     pool_->hsha_server_stat_->inqueue_wait_time_costs_ += queue_wait_time_ms;
     pool_->hsha_server_stat_->inqueue_wait_time_costs_count_++;
 
     BaseResponse *resp{req->GenResponse()};
+    //如果从数据队列中拉取请求数据超时，那么drop这个请求
     if (queue_wait_time_ms < MAX_QUEUE_WAIT_TIME_COST) {
         HshaServerStat::TimeCost time_cost;
 
         DispatcherArgs_t dispatcher_args(pool_->hsha_server_stat_->hsha_server_monitor_,
                 worker_scheduler_, pool_->args_);
+        /**
+         * 下面执行路由函数
+         * 这个dispatch_其实是真的处理逻辑函数，是由最外层的
+         * server_main.cpp中定义的，一般是void HttpDispatch(...)
+         * 这个函数内部会根据调用的函数做一些分发，从而调用真是的处理函数
+         */
         pool_->dispatch_(req, resp, &dispatcher_args);
 
         pool_->hsha_server_stat_->worker_time_costs_ += time_cost.Cost();
@@ -474,9 +485,15 @@ void Worker::WorkerLogic(void *args, BaseRequest *req, int queue_wait_time_ms) {
     } else {
         pool_->hsha_server_stat_->worker_drop_requests_++;
     }
+    /**
+     * 将response数据fill给到data_flow_
+     */
     pool_->data_flow_->PushResponse(args, resp);
     pool_->hsha_server_stat_->outqueue_push_responses_++;
-
+    //IO调度使用的是epoll
+    /**
+     * 通知epoll有response数据可读了
+     */
     pool_->scheduler_->NotifyEpoll();
 
     delete req;
@@ -496,7 +513,17 @@ void Worker::Shutdown() {
 }
 
 ////////////////////////////////////////
-
+/**
+ * 管理所有worker
+ * @param scheduler
+ * @param thread_count
+ * @param uthread_count_per_thread
+ * @param utherad_stack_size
+ * @param data_flow
+ * @param hsha_server_stat
+ * @param dispatch
+ * @param args
+ */
 WorkerPool::WorkerPool(
         UThreadEpollScheduler * scheduler,
         int thread_count,
@@ -544,7 +571,7 @@ HshaServerIO::HshaServerIO(int idx, UThreadEpollScheduler * scheduler, const Hsh
 
 HshaServerIO::~HshaServerIO() {
 }
-
+//生产者
 bool HshaServerIO::AddAcceptedFd(int accepted_fd) {
     lock_guard<mutex> lock(queue_mutex_);
     if (accepted_fd_list_.size() > MAX_ACCEPT_QUEUE_LENGTH) {
@@ -557,22 +584,42 @@ bool HshaServerIO::AddAcceptedFd(int accepted_fd) {
     }
     return true;
 }
-
+    /**
+     * 在epoll scheduler中增加一些Task
+     */
+//消费者
 void HshaServerIO::HandlerAcceptedFd() {
     lock_guard<mutex> lock(queue_mutex_);
     while (!accepted_fd_list_.empty()) {
         int accepted_fd = accepted_fd_list_.front();
         accepted_fd_list_.pop();
+        /**
+         * 调度器增加一个task
+         * 以后每次使用epoll响应这些client的fd
+         * 执行函数IOFunc
+         */
         scheduler_->AddTask(bind(&HshaServerIO::IOFunc, this, accepted_fd), nullptr);
     }
 }
 
 void HshaServerIO::IOFunc(int accepted_fd) {
+    /**
+     * 创建UThreadSocket_t,对原始的socket fd增加一些属性
+     */
     UThreadSocket_t *socket{scheduler_->CreateSocket(accepted_fd)};
     UThreadTcpStream stream;
+    /**
+     * 新建一个缓冲区绑定到socket上
+     * 这里把socket和缓冲区绑定在一起，下面的处理很方便
+     */
     stream.Attach(socket);
+    /**
+     * 设置socket超时时间
+     */
     UThreadSetSocketTimeout(*socket, config_->GetSocketTimeoutMS());
-
+    /**
+     * 大循环
+     */
     while (true) {
         HshaServerStat::TimeCost time_cost;
 
@@ -584,6 +631,7 @@ void HshaServerIO::IOFunc(int accepted_fd) {
         unique_ptr<BaseProtocol> protocol(factory->GenProtocol());
         // will be deleted by worker
         BaseRequest *req{nullptr};
+        //接收请求
         ReturnCode ret{protocol->ServerRecv(stream, req)};
         if (ReturnCode::OK != ret) {
             delete req;
@@ -597,13 +645,18 @@ void HshaServerIO::IOFunc(int accepted_fd) {
 
         hsha_server_stat_->io_read_bytes_ += req->GetContent().size();
 
+        /**
+         * 判断data flow是否可以push请求到data flow队列中
+         */
         if (!data_flow_->CanPushRequest(config_->GetMaxQueueLength())) {
             delete req;
             hsha_server_stat_->queue_full_rejected_after_accepted_fds_++;
 
             break;
         }
-
+        /**
+         * Qos保证
+         */
         if (!hsha_server_qos_->CanEnqueue()) {
             // fast reject don't cal rpc_time_cost;
             delete req;
@@ -619,12 +672,46 @@ void HshaServerIO::IOFunc(int accepted_fd) {
         const string version(req->GetVersion() != nullptr ?  req->GetVersion() : "");
 
         hsha_server_stat_->inqueue_push_requests_++;
+        /**
+         * 将获取request push到data flow队列中去
+         */
         data_flow_->PushRequest((void *)socket, req);
         // if is uthread worker mode, need notify.
         // req deleted by worker after this line
+        /**
+         * 这一块需要注意
+         * 如果worker是uthread协程模式
+         * 那么需要下面worker_pool_->Notify()是有效的，
+         * 如果是线程模式无效，这个可以具体看worker中的UThreadMode()
+         * 函数和ThreadMode()函数。对于ThreadMode，如果线程没有数据可读，
+         * 那么会阻塞，如果是UthreadMode是epoll进行调度，
+         * 所以当有数据work pool会告诉某个worker（论询告诉），
+         * worker会发一个Notify给自己的epoll echeduler，
+         * 提醒有数据可以读取了，然后worker的协程就可以读取了。
+         * （注意上面的epoll scheduler是worker自己私有的，和前面不一样）
+         *
+         * 简单来说，这一步就是通知worker可以做事了，worker做完后将resp放到data flow中
+         * epoll中的HshaServerIO::ActiveSocketFunc() 函数
+         * 会取出response放到socket的args中
+         */
         worker_pool_->Notify();
+        /**
+         * 设置socket参数null
+         */
         UThreadSetArgs(*socket, nullptr);
 
+        /**
+         * 这一步特别有意思，UThreadWait本质上是当前client协程让出
+         * CPU，挂起，等待数据
+         * 如果超时那么socket中数据是空，需要退出
+         * 这一步什么时候得到数据呢？
+         * epoll中会主动去拉取data flow的response
+         * 然后在相关的函数中会将response写入socket关联的缓冲区
+         * 这样如果在超时时间内写入，那么下面的
+         * UThreadGetArgs(*socket)!= nullptr
+         * 那么就完成了一次交互过程
+         * 耦合性有点强
+         */
         UThreadWait(*socket, config_->GetSocketTimeoutMS());
         if (UThreadGetArgs(*socket) == nullptr) {
             // timeout
@@ -641,11 +728,17 @@ void HshaServerIO::IOFunc(int accepted_fd) {
             break;
         }
 
+        /**
+         * 获取response
+         */
         hsha_server_stat_->io_write_responses_++;
         {
             BaseResponse *resp((BaseResponse *)UThreadGetArgs(*socket));
             if (!resp->fake()) {
                 ret = resp->ModifyResp(is_keep_alive, version);
+                /**
+                 * 发送response给client
+                 */
                 ret = resp->Send(stream);
                 hsha_server_stat_->io_write_bytes_ += resp->GetContent().size();
             }
@@ -659,6 +752,9 @@ void HshaServerIO::IOFunc(int accepted_fd) {
             hsha_server_stat_->io_write_fails_++;
         }
 
+        /**
+         * 如果不是keep live 那么break
+         */
         if (!is_keep_alive || (ReturnCode::OK != ret)) {
             break;
         }
@@ -671,6 +767,9 @@ UThreadSocket_t *HshaServerIO::ActiveSocketFunc() {
     while (data_flow_->CanPluckResponse()) {
         void *args = nullptr;
         BaseResponse *response = nullptr;
+        /**
+         * 从dataflow拉取response数据
+         */
         int queue_wait_time_ms = data_flow_->PluckResponse(args, response);
         if (response == nullptr) {
             //break out
@@ -697,6 +796,14 @@ UThreadSocket_t *HshaServerIO::ActiveSocketFunc() {
 }
 
 void HshaServerIO::RunForever() {
+    /**
+             * epoll在轮询的时候会判断server unit这个结构中是否存在数据
+             * 如果有说明有新的client，那么需要处理。
+             * 对应epoll轮询的handler_accepted_fd_func_函数，
+             * 这个函数在epoll初始化之前被赋值
+             * scheduler_->SetHandlerAcceptedFdFunc(std::bind(
+             * &HshaServerIO::HandlerAcceptedFd,this));
+             */
     scheduler_->SetHandlerAcceptedFdFunc(bind(&HshaServerIO::HandlerAcceptedFd, this));
     scheduler_->SetActiveSocketFunc(bind(&HshaServerIO::ActiveSocketFunc, this));
     scheduler_->RunForever();
@@ -718,10 +825,23 @@ HshaServerUnit::HshaServerUnit(
 #else
     scheduler_(32 * 1024, 1000000, false),
 #endif
+    /**
+     * 创建worker pool
+     * 本质相当于一个线程池
+     * 每个worker是一个线程，在new Worker的时候创建的
+     */
     worker_pool_(&scheduler_, worker_thread_count, worker_uthread_count_per_thread,
             worker_utherad_stack_size, &data_flow_, &hsha_server_->hsha_server_stat_, dispatch, args),
+    /**
+     * server io
+     */
     hsha_server_io_(idx, &scheduler_, hsha_server_->config_, &data_flow_,
             &hsha_server_->hsha_server_stat_, &hsha_server_->hsha_server_qos_, &worker_pool_),
+    /**
+     * 需要注意：当前的这个线程是epoll的io线程
+     * 看RunFunc里面的代码就知道了
+     * 后面调用了scheduler_->RunForever();
+     */
     thread_(&HshaServerUnit::RunFunc, this) {
 }
 
@@ -779,6 +899,7 @@ void HshaServerAcceptor::LoopAccept(const char * bind_ip, const int port) {
             }
 
             idx_ %= hsha_server_->server_unit_list_.size();
+            //如果第idx_个server可以，就AddAcceptedFd
             if (!hsha_server_->server_unit_list_[idx_++]->AddAcceptedFd(accepted_fd)) {
                 hsha_server_->hsha_server_stat_.rejected_fds_++;
                 phxrpc::log(LOG_ERR, "%s accept queue full, reject accept, fd %d", __func__, accepted_fd);
@@ -819,6 +940,7 @@ HshaServer::HshaServer(const HshaServerConfig &config,
         if (i == io_count - 1) {
             worker_thread_count_per_io = worker_thread_count - (worker_thread_count_per_io * (io_count - 1));
         }
+        //每个HshaServer会创建很多Server Unit
         auto hsha_server_unit =
             new HshaServerUnit(this, i, (int)worker_thread_count_per_io,
                     config.GetWorkerUThreadCount(), worker_utherad_stack_size, dispatch, args);
