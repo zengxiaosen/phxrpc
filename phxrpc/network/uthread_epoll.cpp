@@ -56,6 +56,9 @@ typedef struct tagUThreadSocket {
     int socket_timeout_ms;
 
     int waited_events;
+    /**
+     * 保存这个socket的定时器在heap的数组中的位置（如果存在），方便在堆中的查找
+     */
     size_t timer_id;
     struct epoll_event event;
     void * args;
@@ -332,15 +335,35 @@ void UThreadEpollScheduler::DealwithTimeout(int & next_timeout) {
 int UThreadPoll(UThreadSocket_t & socket, int events, int * revents, int timeout_ms) {
     int ret = -1;
 
+    /**
+     * 获得当前正在执行的协程，需要这个协程帮忙做点事
+     */
     socket.uthread_id = socket.scheduler->GetCurrUThread();
 
+    /**
+     * 增加超时事件
+     */
     socket.event.events = events;
 
     socket.scheduler->AddTimer(&socket, timeout_ms);
+    /**
+     * 事件加入epoll
+     * 理论上讲，AddTimer将这个超时事件加入额外管理的heap定时器就ok了
+     * 此处为什么还需要加入epoll中进行调度？
+     * 原因在于，在超时事件还没到达的时候，可能就有事件触发了，使得下面这一轮提前结束
+     */
     epoll_ctl(socket.epoll_fd, EPOLL_CTL_ADD, socket.socket, &socket.event);
 
+    /**
+     * 将当前的协程停止，转让cpu给主协程
+     * 当主协程下次收到这个超时事件的时候会将执行权还给这个协程
+     * 协程下次还是从当前位置开始执行
+     */
     socket.scheduler->YieldTask();
-
+    /**
+     * 当超时任务完成，协程继续从此处执行！
+     * 完成后从epoll中删除定时器
+     */
     epoll_ctl(socket.epoll_fd, EPOLL_CTL_DEL, socket.socket, &socket.event);
     socket.scheduler->RemoveTimer(socket.timer_id);
 
